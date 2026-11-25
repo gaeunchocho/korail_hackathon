@@ -1,230 +1,263 @@
+"""열차 고장 유사 사례 검색 — 로컬 웹앱.
+
+    python app.py --csv "C:\\Users\\user\\Downloads\\FRACAS_20220830_utf8.csv"
+"""
+
 import argparse
-import csv
-import math
-import re
-import unicodedata
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from datetime import date, time
-from html import escape
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
+
+from classify import classify
+from keyword_search import CsvError, KeywordIndex, load_cases
+from speech import DEFAULT_RECORDS_PATH, DEFAULT_WHISPER_DIR, RecordStore, Transcriber, split_dictation
+from semantic import DEFAULT_MODEL_DIR, MODEL_NAME, SemanticIndex, combine_ranks, load_model
+
+RESULT_LIMIT = 5
+MISSING = "미기록"
+MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 약 10MB (수 분 분량)
+PAGE = Path(__file__).resolve().parent / "static" / "index.html"
 
 
-def features(text):
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    words = re.findall(r"[^\W_]+", normalized)
-    counts = Counter(("글자", word[i:i + 2]) for word in words for i in range(len(word) - 1))
-    counts.update(("단어", word) for word in words)
-    return counts
+class SearchService:
+    """CSV 사례, 키워드 색인, (가능하면) AI 색인을 갖고 있습니다."""
 
+    def __init__(self, cases=None, csv_error=None):
+        self.cases = cases or []
+        self.csv_error = csv_error
+        self.keyword = KeywordIndex(self.cases) if self.cases else None
+        self.semantic = None
+        self.ai_state = "off"  # off / loading / ready / error
+        self.ai_status = "AI 의미 검색을 켜지 않았습니다."
 
-@dataclass(frozen=True)
-class Case:
-    case_id: str
-    occurred: str
-    location: str
-    description: str
-    origin: str
-    destination: str
-    vehicle_count: str
-    introduced_on: str
+    @property
+    def ai_ready(self):
+        return self.ai_state == "ready"
 
-
-class CaseSearch:
-    def __init__(self, path):
-        self.cases = []
-        documents = []
-        seen = set()
-        with path.open(encoding="utf-8-sig", newline="") as source:
-            reader = csv.DictReader(source)
-            columns = (
-                "FRACAS관리번호", "고장발생일자", "고장발생시각", "발생장소명", "운행장애개요내용",
-                "시발역명", "종착역명", "열차차량수", "차량도입일자",
-            )
-            if not set(columns).issubset(reader.fieldnames or ()):
-                raise ValueError("CSV에 필요한 열이 없습니다.")
-            for row in reader:
-                try:
-                    case_id, day, clock, location, description = (row[key] for key in columns[:5])
-                    case_id = case_id.strip()
-                    day = date.fromisoformat(day.strip()).isoformat()
-                    clock = time.fromisoformat(clock.strip()).isoformat(timespec="minutes")
-                    terms = features(description)
-                    if not case_id or case_id in seen or not terms:
-                        raise ValueError
-                except (AttributeError, ValueError):
-                    raise ValueError(f"CSV {reader.line_num}행의 관리번호, 발생 일시, 설명을 확인해 주세요.") from None
-                seen.add(case_id)
-                self.cases.append(Case(
-                    case_id, f"{day} {clock}", (location or "").strip(), description,
-                    origin=(row["시발역명"] or "").strip(),
-                    destination=(row["종착역명"] or "").strip(),
-                    vehicle_count=(row["열차차량수"] or "").strip(),
-                    introduced_on=(row["차량도입일자"] or "").strip(),
-                ))
-                documents.append(terms)
+    def start_ai(self, model_dir, model_loader=load_model, show_progress=True):
+        """모델을 읽고 사례 임베딩을 만듭니다. 실패해도 키워드 검색은 계속 쓸 수 있습니다."""
         if not self.cases:
-            raise ValueError("CSV에 검색할 사례가 없습니다.")
+            self.ai_state, self.ai_status = "error", "CSV를 읽지 못해 AI 의미 검색을 준비하지 않았습니다."
+            return
+        self.ai_state, self.ai_status = "loading", "AI 모델을 준비하고 있습니다 (CPU에서 약 3~4분)."
+        try:
+            model = model_loader(model_dir)
+            self.semantic = SemanticIndex(self.cases, model, show_progress=show_progress)
+        except Exception as error:
+            self.ai_state, self.ai_status = "error", f"AI 의미 검색을 쓸 수 없습니다: {error}"
+            print(f"[AI] 로드 실패: {error}", file=sys.stderr, flush=True)
+            return
+        self.ai_state, self.ai_status = "ready", f"AI 의미 검색 사용 가능 ({MODEL_NAME}, 이 PC에서 실행)"
+        print(f"[AI] 준비 완료: 사례 {len(self.cases)}건 임베딩", flush=True)
 
-        frequencies = Counter(term for document in documents for term in document)
-        self.weights = {
-            term: 1 + math.log((1 + len(documents)) / (1 + frequency))
-            for term, frequency in frequencies.items()
+    def search(self, query, mode):
+        """(사례 목록, 실제 사용한 방식)을 돌려줍니다. AI를 못 쓰면 키워드로 검색합니다."""
+        ranking = self.keyword.rank(query)
+        if mode == "hybrid" and self.ai_ready:
+            ranking = combine_ranks(ranking, self.semantic.rank(query))
+        else:
+            mode = "keyword"
+        return [self.cases[index] for index in ranking[:RESULT_LIMIT]], mode
+
+    def status(self):
+        return {
+            "csv_error": self.csv_error,
+            "case_count": len(self.cases),
+            "ai_state": self.ai_state,
+            "ai_status": self.ai_status,
+            "has_actions": any(case.action_kind for case in self.cases),
         }
-        self.postings = defaultdict(list)
-        for index, document in enumerate(documents):
-            weights = {term: count * self.weights[term] for term, count in document.items()}
-            norm = math.hypot(*weights.values())
-            for term, weight in weights.items():
-                self.postings[term].append((index, weight / norm))
 
-    def search(self, query, limit=5):
-        scores = defaultdict(float)
-        for term, count in features(query).items():
-            weight = count * self.weights.get(term, 0)
-            for index, document_weight in self.postings.get(term, ()):
-                scores[index] += weight * document_weight
-        # For a fixed query, its norm is constant across results.
-        ranked = sorted(scores, key=lambda index: (-scores[index], self.cases[index].case_id))
-        return [self.cases[index] for index in ranked[:limit]]
-
-
-def render(query="", results=()):
-    if results:
-        cards = "".join(
-            f"""<li>
-              <details>
-                <summary>
-                  <strong>관리번호 {escape(case.case_id)}</strong>
-                  <span>발생 일시 <time datetime="{case.occurred}">{case.occurred}</time></span>
-                  <span>발생 장소 {escape(case.location or "장소 미기록")}</span>
-                </summary>
-                <div class="description">
-                  <dl class="metadata">
-                    <div><dt>시발역</dt><dd>{escape(case.origin or "미기록")}</dd></div>
-                    <div><dt>종착역</dt><dd>{escape(case.destination or "미기록")}</dd></div>
-                    <div><dt>차량 수</dt><dd>{escape(case.vehicle_count + "량" if case.vehicle_count else "미기록")}</dd></div>
-                    <div><dt>차량 도입일</dt><dd>{escape(case.introduced_on or "미기록")}</dd></div>
-                  </dl>
-                  <h3>운행장애 개요 원문</h3>
-                  <p>{escape(case.description)}</p>
-                </div>
-              </details>
-            </li>"""
-            for case in results
-        )
-        content = f"""
-        <section aria-labelledby="results">
-          <h2 id="results">유사 사례 {len(results)}건</h2>
-          <p>사례를 펼치면 당시 조치가 포함될 수 있는 운행장애 개요 원문을 볼 수 있습니다.</p>
-          <ol>{cards}</ol>
-        </section>"""
-    elif query:
-        content = '<p role="status">일치하는 사례가 없습니다. 다른 증상 표현으로 검색해 보세요.</p>'
-    else:
-        content = ""
-    return f"""<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>열차 고장 유사 사례 검색</title>
-  <style>
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: #f1f5fa; color: #18283b; font: 16px/1.55 system-ui, sans-serif; }}
-    main {{ max-width: 760px; padding: 32px clamp(18px, 5vw, 48px); margin: clamp(20px, 8vw, 72px) auto;
-            background: white; border: 1px solid #d5dfeb; border-radius: 16px; }}
-    h1 {{ margin: 0 0 24px; font-size: clamp(24px, 5vw, 36px); }}
-    label {{ font-weight: 700; }}
-    .controls {{ display: flex; gap: 8px; margin-top: 6px; }}
-    input, button {{ min-height: 46px; padding: 8px 12px; font: inherit; border-radius: 8px; }}
-    input {{ flex: 1; min-width: 0; border: 1px solid #788aa1; }}
-    button {{ border: 0; background: #174987; color: white; cursor: pointer; }}
-    :focus-visible {{ outline: 3px solid #477bc0; outline-offset: 3px; }}
-    section {{ margin-top: 28px; }}
-    h2 {{ margin-bottom: 4px; font-size: 22px; }}
-    section > p {{ margin-top: 0; color: #455a72; }}
-    ol {{ list-style: none; padding: 0; }}
-    li + li {{ margin-top: 10px; }}
-    details {{ border: 1px solid #d5dfeb; border-radius: 10px; overflow-wrap: anywhere; }}
-    summary {{ padding: 12px 16px; background: #eef4fb; border-radius: 10px; cursor: pointer; }}
-    summary span {{ display: block; margin-left: 18px; color: #334c68; }}
-    .description {{ padding: 0 16px 8px; }}
-    .metadata {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px 16px; }}
-    .metadata dt {{ font-weight: 700; }}
-    .metadata dd {{ margin: 0; }}
-    h3 {{ margin: 12px 0 6px; font-size: 16px; }}
-    .description p {{ margin-top: 0; white-space: pre-wrap; }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>열차 고장 유사 사례 검색</h1>
-    <form method="post" action="/">
-      <label for="query">고장 증상</label>
-      <div class="controls">
-        <input id="query" name="query" value="{escape(query, quote=True)}" maxlength="300"
-               placeholder="예시 · 정차 후 출입문이 닫히지 않음" required>
-        <button type="submit">검색</button>
-      </div>
-    </form>
-    {content}
-  </main>
-</body>
-</html>"""
+    def api_search(self, query):
+        """화면에 보낼 검색 결과(JSON용 dict)를 만듭니다."""
+        if self.csv_error:
+            return {"error": self.csv_error}
+        query = query.strip()[:300]
+        if not query:
+            return {"error": "고장 증상을 입력해 주세요."}
+        # AI가 준비되어 있으면 자동으로 하이브리드, 아니면 키워드 검색
+        results, used = self.search(query, "hybrid")
+        return {
+            "query": query,
+            "mode": used,
+            # 유사도로 고른 상위 5건을 최근 발생 순으로 보여줍니다(유사도 순위는 similarity_rank로 함께 보냄).
+            "results": sorted(
+                (dict(case_to_dict(case), similarity_rank=rank) for rank, case in enumerate(results, start=1)),
+                key=lambda item: (item["occurred"] != MISSING, item["occurred"]), reverse=True),
+            "highlight": self.keyword.highlight_terms(query),
+            "delay_summary": delay_summary(results),
+            "device": classify(query),
+        }
 
 
-def make_server(search, port):
+def as_int(text):
+    return int(text) if text.isdigit() else None
+
+
+def delay_summary(cases):
+    """유사 사례의 지연 시간(분) 요약. 지연 값이 기록된 사례만 셉니다."""
+    delays = [d for d in (as_int(case.delay_minutes) for case in cases) if d is not None]
+    if not delays:
+        return None
+    return {"count": len(delays), "average": round(sum(delays) / len(delays), 1), "max": max(delays),
+            "delayed": sum(1 for d in delays if d > 0)}
+
+
+def value(text):
+    return text if text else MISSING
+
+
+FILLED_KEYS = {"발생장소명": "location", "시발역명": "origin", "종착역명": "destination",
+               "열차차량수": "vehicle_count", "차량도입일자": "introduced_on", "정비단": "team"}
+
+
+def case_to_dict(case):
+    """CSV 값을 그대로 옮기고 빈 값만 '미기록'으로 바꿉니다. 없는 정보는 만들지 않습니다."""
+    occurred = " ".join(part for part in (case.date, case.clock) if part)
+    action = None
+    if case.action or case.action_kind:
+        action = {
+            "kind": value(case.action_kind),
+            "team": value(case.team),
+            "type": value(case.maintenance_type),
+            "text": value(case.action),
+            "is_demo": not case.action_kind.startswith("기록된 조치"),
+        }
+    return {
+        "id": value(case.case_id),
+        "occurred": value(occurred),
+        "location": value(case.location),
+        "origin": value(case.origin),
+        "destination": value(case.destination),
+        "vehicle_count": value(case.vehicle_count),
+        "introduced_on": value(case.introduced_on),
+        "description": case.description,
+        "action": action,
+        "device": classify(case.description),
+        "delay_minutes": as_int(case.delay_minutes),
+        "affected_trains": as_int(case.affected_trains),
+        "filled": [FILLED_KEYS[name] for name in case.filled.split(",") if name in FILLED_KEYS],
+    }
+
+
+def make_server(service, port, transcriber=None, records=None):
+    transcriber = transcriber or Transcriber()
+
     class Handler(BaseHTTPRequestHandler):
-        def page(self, html):
-            payload = html.encode("utf-8")
+        def send(self, payload, content_type):
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
 
+        def send_json(self, data):
+            self.send(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+        def read_body(self, limit):
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= length <= limit:
+                raise ValueError
+            return self.rfile.read(length)
+
         def do_GET(self):
-            if urlsplit(self.path).path == "/":
-                self.page(render())
+            url = urlsplit(self.path)
+            if url.path == "/":
+                self.send(PAGE.read_bytes(), "text/html; charset=utf-8")
+            elif url.path == "/api/status":
+                status = service.status()
+                status.update(voice_state=transcriber.state, voice_status=transcriber.status,
+                              records_enabled=records is not None)
+                self.send_json(status)
+            elif url.path == "/api/records" and records is not None:
+                self.send_json({"records": records.recent()})
             else:
                 self.send_error(404)
 
         def do_POST(self):
-            if urlsplit(self.path).path != "/":
-                self.send_error(404)
-                return
+            path = urlsplit(self.path).path
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if not 0 <= length <= 8192:
-                    raise ValueError
-                body = self.rfile.read(length).decode("utf-8")
-            except ValueError:
+                if path == "/api/transcribe":
+                    audio = self.read_body(MAX_AUDIO_BYTES)
+                elif path in ("/api/search", "/api/records", "/api/split"):
+                    body = json.loads(self.read_body(8192).decode("utf-8"))
+                    if not isinstance(body, dict):
+                        raise ValueError
+                else:
+                    self.send_error(404)
+                    return
+            except (ValueError, UnicodeDecodeError):
                 self.send_error(400)
                 return
-            query = parse_qs(body).get("query", [""])[0].strip()[:300]
-            self.page(render(query, search.search(query)))
+            if path == "/api/search":
+                self.send_json(service.api_search(str(body.get("query", ""))))
+            elif path == "/api/transcribe":
+                try:
+                    text = transcriber.transcribe(audio)
+                except Exception as error:
+                    self.send_json({"error": f"음성을 글자로 바꾸지 못했습니다: {error}"})
+                    return
+                self.send_json({"text": text} if text else {"error": "알아들은 말이 없습니다. 다시 말해 주세요."})
+            elif path == "/api/split":
+                self.send_json({"fields": split_dictation(str(body.get("text", ""))[:2000])})
+            elif records is None:
+                self.send_json({"error": "현장 기록 저장을 켜지 않았습니다."})
+            else:
+                try:
+                    row = records.add(body)
+                except (ValueError, OSError) as error:
+                    self.send_json({"error": f"기록을 저장하지 못했습니다: {error}"})
+                    return
+                self.send_json({"record": row})
 
         def log_message(self, format, *args):
-            pass
+            pass  # 검색어와 음성 내용을 로그에 남기지 않습니다.
 
-    return HTTPServer(("127.0.0.1", port), Handler)
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
+def build_service(csv_path):
+    try:
+        cases = load_cases(csv_path)
+    except CsvError as error:
+        print(f"[CSV] {error}", file=sys.stderr, flush=True)
+        return SearchService(csv_error=str(error))
+    print(f"[CSV] 사례 {len(cases)}건을 읽었습니다.", flush=True)
+    return SearchService(cases)
 
 
 def main():
     parser = argparse.ArgumentParser(description="열차 고장 유사 사례 로컬 검색")
-    parser.add_argument("--csv", type=Path, required=True, help="원본 FRACAS CSV 파일 경로")
+    parser.add_argument("--csv", type=Path, required=True, help="원본 FRACAS CSV 경로 (읽기 전용)")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="로컬 모델 폴더")
+    parser.add_argument("--no-ai", action="store_true", help="AI 의미 검색을 켜지 않고 키워드만 사용")
+    parser.add_argument("--whisper-dir", type=Path, default=DEFAULT_WHISPER_DIR, help="음성 인식 모델 폴더")
+    parser.add_argument("--no-voice", action="store_true", help="음성 입력을 켜지 않음")
+    parser.add_argument("--records", type=Path, default=DEFAULT_RECORDS_PATH,
+                        help="현장 고장 기록을 저장할 CSV (원본과 다른 파일)")
     args = parser.parse_args()
+    if args.records.resolve() == args.csv.resolve():
+        parser.exit(2, "기록 파일을 원본 CSV와 같은 경로로 지정할 수 없습니다.\n")
+
+    service = build_service(args.csv)
     try:
-        server = make_server(CaseSearch(args.csv), args.port)
-    except (OSError, ValueError) as error:
-        parser.exit(2, f"{error}\n")
+        transcriber = Transcriber()
+        server = make_server(service, args.port, transcriber, RecordStore(args.records))
+    except OSError as error:
+        parser.exit(2, f"포트 {args.port}를 열 수 없습니다: {error}. --port 8001 처럼 다른 번호를 써 보세요.\n")
+    if not args.no_ai:
+        # 모델 준비(수 분)를 기다리지 않고 키워드 검색부터 쓸 수 있도록 뒤에서 준비합니다.
+        threading.Thread(target=service.start_ai, args=(args.model_dir,), daemon=True).start()
+    if not args.no_voice:
+        threading.Thread(target=transcriber.start, args=(args.whisper_dir,), daemon=True).start()
+    print(f"[기록] 현장 고장 기록 파일: {args.records}", flush=True)
     with server:
-        print(f"http://127.0.0.1:{server.server_port}", flush=True)
+        print(f"브라우저에서 여세요: http://127.0.0.1:{server.server_port}  (종료: Ctrl+C)", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

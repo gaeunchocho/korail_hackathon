@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>열차 고장 기록</title>
+<style>
+  :root {
+    --text: #1f2328; --sub: #4d5560; --muted: #848d97; --line: #e1e4e8; --hover: #f6f8fa; --bg: #f4f5f7;
+    --ink: #24292f; --accent: #0f6c8c; --accent-soft: #e6f2f6; --ok: #1a7f37; --warn: #8a5a00; --warn-bg: #fbf3df;
+    --err: #b3261e; --mark: #fff1a8;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased;
+         font: 15px/1.6 "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; }
+  button, input, textarea { font: inherit; color: inherit; }
+
+  header { background: var(--ink); color: #fff; }
+  .bar { display: flex; align-items: center; gap: 12px; max-width: 1200px; margin: 0 auto; padding: 12px 24px; }
+  .bar h1 { margin: 0; font-size: 16px; font-weight: 700; }
+  .bar .sub { font-size: 13px; color: #a9b1ba; }
+  .status { margin-left: auto; font-size: 12.5px; color: #c9d1d9; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #6e7781; }
+  .status.ready .dot { background: #3fb950; } .status.loading .dot { background: #d29922; } .status.error .dot { background: #f85149; }
+
+  main { max-width: 1200px; margin: 0 auto; padding: 20px 24px 48px; }
+  .layout { display: grid; grid-template-columns: 1fr; gap: 16px; align-items: start; }
+  .panel { background: #fff; border: 1px solid var(--line); border-radius: 8px; }
+  .panel-title { display: flex; align-items: baseline; gap: 8px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line);
+                 font-size: 14px; font-weight: 700; }
+  .panel-title small { margin-left: auto; font-size: 12.5px; font-weight: 400; color: var(--muted); }
+  .panel-body { padding: 16px; }
+  .notice { margin-bottom: 14px; padding: 10px 12px; border-left: 3px solid var(--warn); background: var(--warn-bg);
+            color: var(--warn); font-size: 13.5px; border-radius: 4px; }
+  .notice.error { border-color: var(--err); background: #fdeeec; color: var(--err); }
+
+  /* 증상 */
+  .field-label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 600; color: var(--sub); }
+  .symptom { display: flex; align-items: center; border: 1px solid #c4cad1; border-radius: 6px; background: #fff; }
+  .symptom:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .symptom input { flex: 1; min-width: 0; height: 46px; padding: 0 12px; border: 0; background: transparent; font-size: 16px; }
+  .symptom input:focus { outline: none; }
+  .iconbtn { flex: none; width: 40px; height: 40px; margin-right: 2px; border: 0; border-radius: 6px; background: none;
+             color: var(--accent); cursor: pointer; display: grid; place-items: center; }
+  .iconbtn:hover { background: var(--accent-soft); }
+  .iconbtn svg { width: 19px; height: 19px; }
+  .iconbtn.recording { color: #fff; background: var(--err); }
+  .iconbtn:disabled { opacity: .5; cursor: wait; }
+  .btn { flex: none; height: 38px; margin: 3px; padding: 0 18px; border: 0; border-radius: 5px; background: var(--accent); color: #fff;
+         font-size: 14px; font-weight: 600; cursor: pointer; }
+  .btn:hover { filter: brightness(.92); }
+  .mic-label { margin: 6px 0 0; font-size: 12.5px; color: var(--muted); min-height: 20px; }
+  .mic-label.rec { color: var(--err); font-weight: 600; }
+
+  /* 유사 사례 */
+  .cards { list-style: none; margin: 0; padding: 0; }
+  .card + .card { border-top: 1px solid var(--line); }
+  .card > button { display: grid; grid-template-columns: 26px 118px 1fr auto; gap: 12px; align-items: start; width: 100%;
+                   padding: 12px 16px; border: 0; background: none; text-align: left; cursor: pointer; }
+  .card > button:hover { background: var(--hover); }
+  .num { width: 22px; height: 22px; border-radius: 4px; background: #eaeef2; color: var(--sub); font-size: 12px; font-weight: 700;
+         display: grid; place-items: center; margin-top: 1px; }
+  .card.open .num { background: var(--accent); color: #fff; }
+  .card-meta { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; line-height: 1.5; padding-top: 2px; }
+  .card-text { font-size: 15px; }
+  .chips { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; padding-top: 1px; }
+  .chip { font-size: 11.5px; padding: 1px 7px; border-radius: 999px; background: #eaeef2; color: var(--sub); white-space: nowrap; }
+  .chip.sim { background: var(--accent-soft); color: var(--accent); }
+  .chip.delay { background: #fbeee4; color: #9a4a12; }
+  .stats { display: flex; flex-wrap: wrap; gap: 6px 20px; padding: 10px 16px; border-bottom: 1px solid var(--line);
+           background: var(--hover); font-size: 13px; color: var(--sub); }
+  .stats b { color: var(--text); margin-left: 2px; }
+  .card.open { background: #fbfcfd; box-shadow: inset 3px 0 0 var(--accent); }
+  .card-more { padding: 0 16px 16px 54px; font-size: 13.5px; color: var(--sub); }
+  .card-more dl { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 3px 14px; margin: 0 0 10px; }
+  .card-more dt { color: var(--muted); } .card-more dd { margin: 0; color: var(--text); }
+  .missing { color: #afb6be !important; }
+  .fake { margin-left: 4px; padding: 0 4px; font-size: 11px; border: 1px solid #e6cf95; border-radius: 3px; color: var(--warn); }
+  .action-box { padding: 10px 12px; border-radius: 6px; background: var(--hover); color: var(--text); }
+  .demo { margin-top: 2px; font-size: 12px; color: var(--warn); }
+  mark { background: var(--mark); color: inherit; }
+  .empty { color: var(--muted); padding: 28px 16px; text-align: center; font-size: 14px; }
+
+  /* 기록 */
+  .record-btn { display: block; width: calc(100% - 32px); margin: 4px 16px 16px; height: 42px; border: 1px solid var(--accent);
+                border-radius: 6px; background: #fff; color: var(--accent); font-size: 14px; font-weight: 700; cursor: pointer; }
+  .record-btn:hover { background: var(--accent-soft); }
+  .record { border-top: 3px solid var(--accent); }
+  .record label { display: block; margin: 14px 0 6px; font-size: 13px; font-weight: 600; color: var(--sub); }
+  .record label:first-child { margin-top: 0; }
+  .record textarea, .record input { width: 100%; padding: 9px 11px; border: 1px solid #c4cad1; border-radius: 6px; background: #fff; }
+  .record textarea { min-height: 72px; resize: vertical; }
+  .record textarea:focus, .record input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 3px; margin-bottom: 14px;
+           background: var(--hover); border: 1px solid var(--line); border-radius: 7px; }
+  .modes button { height: 32px; border: 0; border-radius: 5px; background: none; color: var(--sub); font-size: 13.5px;
+                  font-weight: 600; cursor: pointer; }
+  .modes button[aria-pressed="true"] { background: #fff; color: var(--accent); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .direct-oneshot { margin-bottom: 14px; padding: 12px; border: 1px dashed #9cc7d6; border-radius: 6px; background: var(--accent-soft); }
+  .oneshot-btn { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; height: 42px; border: 0;
+                 border-radius: 6px; background: var(--accent); color: #fff; font-size: 14.5px; font-weight: 700; cursor: pointer; }
+  .oneshot-btn svg { width: 18px; height: 18px; }
+  .oneshot-btn.recording { background: var(--err); }
+  .oneshot-btn:disabled { opacity: .6; cursor: wait; }
+  .oneshot-msg { margin: 8px 0 0; font-size: 12.5px; color: var(--sub); }
+  .oneshot-msg.warn { color: var(--warn); }
+  .readonly { padding: 9px 11px; border-radius: 6px; background: var(--hover); color: var(--text); min-height: 40px; }
+  .readonly.placeholder { color: var(--muted); }
+  .row { display: flex; gap: 6px; align-items: flex-start; }
+  .row .iconbtn { width: 40px; height: 40px; border: 1px solid #c4cad1; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .ref { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  .ref button { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 4px; }
+  .save { margin-top: 16px; width: 100%; height: 44px; border: 0; border-radius: 6px; background: var(--accent); color: #fff;
+          font-size: 15px; font-weight: 700; cursor: pointer; }
+  .save:hover { filter: brightness(.92); }
+  .msg { margin: 10px 0 0; font-size: 13.5px; min-height: 20px; text-align: center; }
+  .msg.ok { color: var(--ok); } .msg.error { color: var(--err); }
+  .recent-list { list-style: none; padding: 0; margin: 0; }
+  .recent-list li { padding: 10px 16px; font-size: 13.5px; }
+  .recent-list li + li { border-top: 1px solid var(--line); }
+  .recent-list .card-meta { margin-bottom: 2px; }
+  .foot { margin-top: 24px; font-size: 12px; color: var(--muted); }
+
+  @media (min-width: 1000px) {
+    .layout { grid-template-columns: 1fr 380px; }
+    .side { position: sticky; top: 16px; display: grid; gap: 16px; }
+    .layout #record[hidden] { display: block !important; }
+    .layout #record-open { display: none !important; }
+  }
+  @media (max-width: 999px) { .side { display: grid; gap: 16px; } }
+  @media (max-width: 640px) {
+    .bar .sub { display: none; }
+    .two { grid-template-columns: 1fr; }
+    .card > button { grid-template-columns: 26px 1fr; }
+    .card-meta, .chips { grid-column: 2; }
+    .chips { justify-content: flex-start; }
+    .card > button .num { grid-row: span 3; }
+    .card-more { padding-left: 16px; }
+    .card-more dl { grid-template-columns: auto 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1>열차 고장 기록</h1>
+    <span class="sub" id="count"></span>
+    <span class="status" id="status"><span class="dot"></span><span id="status-text">준비 중</span></span>
+  </div>
+</header>
+<main>
+  <div id="notices"></div>
+  <div class="layout">
+    <div class="side-main">
+      <section class="panel">
+        <div class="panel-body">
+          <label class="field-label" for="symptom">고장 증상</label>
+          <form class="symptom" id="symptom-form">
+            <input id="symptom" maxlength="300" autocomplete="off" placeholder="예: 출입문 닫힘 불량, BC압 상승 불량, SIV 정지">
+            <button class="iconbtn" id="bigmic" type="button" hidden aria-label="말로 입력" title="말로 입력"></button>
+            <button class="btn" type="submit">검색</button>
+          </form>
+          <p class="mic-label" id="mic-label"></p>
+        </div>
+      </section>
+      <section class="panel" id="similar" style="margin-top:16px">
+        <p class="panel-title"><span id="similar-title">유사 과거 사례</span><small id="similar-sub">유사도 상위 5건 · 최근 순</small></p>
+        <div class="stats" id="stats" hidden></div>
+        <ol class="cards" id="cards"><li class="empty">고장 증상을 입력하거나 말하면 비슷한 과거 사례가 여기에 표시됩니다.</li></ol>
+        <button class="record-btn" id="record-open" type="button" hidden>이 고장 기록하기</button>
+      </section>
+    </div>
+    <aside class="side">
+      <section class="panel record" id="record">
+        <p class="panel-title">고장 기록<small id="now"></small></p>
+        <div class="panel-body">
+          <div class="modes" role="group" aria-label="기록 방식">
+            <button type="button" id="mode-search" aria-pressed="true">검색한 증상으로 기록</button>
+            <button type="button" id="mode-direct" aria-pressed="false">직접 기록</button>
+          </div>
+          <div class="direct-oneshot" id="direct-oneshot" hidden>
+            <p class="oneshot-msg" id="oneshot-msg">예: "장소 용산역, 차량 311-14, 증상 출입문 닫힘 불량, 조치 구동부 교체 후 정상 확인"</p>
+          </div>
+          <label for="direct-symptom">고장 증상</label>
+          <div class="readonly placeholder" id="rec-symptom">왼쪽에 입력한 증상이 들어갑니다</div>
+          <div class="row" id="direct-row" hidden><textarea id="direct-symptom" maxlength="500" placeholder="예: 출입문 닫힘 불량"></textarea></div>
+          <label for="action">조치 내용</label>
+          <div class="row" id="action-row"><textarea id="action" maxlength="1000" placeholder="예: 구동부 연결부 교체 후 정상 확인"></textarea></div>
+          <label for="location">장소 · 차량 <span style="color:var(--muted);font-weight:400">(선택)</span></label>
+          <div class="two">
+            <input id="location" maxlength="50" placeholder="예: 용산역 3번선">
+            <input id="vehicle" maxlength="50" placeholder="차량번호">
+          </div>
+          <p class="ref" id="ref" hidden></p>
+          <button class="save" id="save" type="button">기록 저장</button>
+          <p class="msg" id="msg" role="status"></p>
+        </div>
+      </section>
+      <section class="panel" id="recent">
+        <p class="panel-title">최근 기록</p>
+        <ul class="recent-list" id="recent-list"></ul>
+      </section>
+    </aside>
+  </div>
+  <p class="foot">모든 처리는 이 PC 안에서만 이루어지며, 기록·음성을 외부로 보내지 않습니다. 과거 사례는 참고 자료이며 정비 판단을 대신하지 않습니다.</p>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const MIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
+let server = { voice: false, records: false };
+let cases = [], highlight = [], reference = "";
+let recordMode = "search";  // search: 검색한 증상으로 기록, direct: 검색과 무관하게 직접 기록
+
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, val] of Object.entries(props)) {
+    if (key === "class") node.className = val; else if (key.startsWith("on")) node[key] = val; else node.setAttribute(key, val);
+  }
+  for (const child of children) if (child != null) node.append(child);
+  return node;
+}
+const postJson = async (url, body) => (await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+function notice(id, text, kind = "") {
+  let box = document.getElementById("n-" + id);
+  if (!text) { if (box) box.remove(); return; }
+  if (!box) { box = el("div", { id: "n-" + id }); $("notices").append(box); }
+  box.className = "notice " + kind; box.textContent = text;
+}
+
+function recorder(button, onText, onState = () => {}) {
+  // 누르면 녹음, 다시 누르면 멈추고 이 PC에서 글자로 바꿉니다(최대 30초).
+  let rec = null, timer = null;
+  button.onclick = async () => {
+    if (rec) { rec.stop(); return; }
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { notice("mic", "마이크를 사용할 수 없습니다. 브라우저에서 마이크 권한을 허용해 주세요."); return; }
+    notice("mic", "");
+    const chunks = [];
+    rec = new MediaRecorder(stream);
+    rec.ondataavailable = (e) => chunks.push(e.data);
+    rec.onstop = async () => {
+      clearTimeout(timer); rec = null; stream.getTracks().forEach((t) => t.stop());
+      button.classList.remove("recording"); button.disabled = true; onState("busy");
+      try {
+        const data = await (await fetch("/api/transcribe", { method: "POST", body: new Blob(chunks) })).json();
+        if (data.error) notice("mic", data.error); else await onText(data.text);
+      } catch { notice("mic", "음성 변환에 실패했습니다."); }
+      button.disabled = false; onState("idle");
+    };
+    rec.start(); button.classList.add("recording"); onState("rec");
+    timer = setTimeout(() => rec && rec.stop(), 30000);
+  };
+}
+
+function highlighted(text) {
+  const frag = document.createDocumentFragment();
+  const pattern = highlight.length && new RegExp(highlight.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "gi");
+  let last = 0;
+  if (pattern) for (const m of text.matchAll(pattern)) { frag.append(text.slice(last, m.index), el("mark", {}, m[0])); last = m.index + m[0].length; }
+  frag.append(text.slice(last));
+  return frag;
+}
+
+/* 상태 */
+async function refreshStatus() {
+  const s = await (await fetch("/api/status")).json();
+  notice("csv", s.csv_error, "error");
+  $("count").textContent = s.case_count ? `과거 운행장애 ${s.case_count.toLocaleString()}건 참고` : "";
+  $("status").className = "status " + s.ai_state;
+  $("status-text").textContent = { ready: "AI 검색 사용 중", loading: "AI 준비 중 (키워드 검색)", error: "키워드 검색", off: "키워드 검색" }[s.ai_state]
+    + (s.voice_state === "ready" ? " · 음성 가능" : "");
+  $("status").title = s.ai_status + " / " + s.voice_status;
+  const wasVoice = server.voice;
+  server = { voice: s.voice_state === "ready", records: s.records_enabled };
+  if (server.voice && !wasVoice) enableVoice();
+  if (s.ai_state === "loading" || s.voice_state === "loading") setTimeout(refreshStatus, 3000);
+}
+
+function enableVoice() {
+  const big = $("bigmic"); big.innerHTML = MIC; big.hidden = false;
+  const label = { idle: "마이크를 누르고 말할 수 있습니다. \"증상 …, 조치 …\"처럼 말하면 칸을 나눠 넣습니다.",
+                  rec: "● 녹음 중 — 다 말했으면 마이크를 다시 누르세요", busy: "글자로 바꾸는 중…" };
+  $("mic-label").textContent = label.idle;
+  recorder(big, onSpoken, (st) => { $("mic-label").textContent = label[st]; $("mic-label").className = "mic-label" + (st === "rec" ? " rec" : ""); });
+  const small = el("button", { class: "iconbtn", type: "button", "aria-label": "조치 내용 말로 입력", title: "말로 입력" }); small.innerHTML = MIC;
+  recorder(small, (said) => { const a = $("action"); a.value = (a.value.trim() ? a.value.trim() + " " : "") + said; });
+  $("action-row").append(small);
+  // 직접 기록: 녹음 한 번으로 장소·차량·증상·조치를 모두 채웁니다.
+  const oneshot = el("button", { class: "oneshot-btn", type: "button" });
+  const oneshotIdle = () => { oneshot.innerHTML = MIC; oneshot.append("한 번에 말하기"); };
+  oneshotIdle();
+  recorder(oneshot, async (said) => {
+    const { fields } = await postJson("/api/split", { text: said });
+    const named = ["location", "vehicle", "symptom", "action"].filter((k) => fields[k]);
+    const box = { location: "location", vehicle: "vehicle", symptom: "direct-symptom", action: "action" };
+    for (const key of named) $(box[key]).value = fields[key];
+    if (fields.unsplit && !fields.symptom) $("direct-symptom").value = fields.unsplit;
+    const msg = $("oneshot-msg");
+    msg.className = "oneshot-msg" + (named.length ? "" : " warn");
+    msg.textContent = named.length
+      ? `${named.length}개 칸을 채웠습니다. 확인 후 저장하세요.`
+      : "말머리(장소·차량·증상·조치)를 찾지 못해 증상 칸에 넣었습니다. 확인 후 고쳐 주세요.";
+  }, (st) => {
+    oneshot.lastChild.textContent = { idle: "한 번에 말하기", rec: "녹음 중 · 다 말했으면 다시 누르세요", busy: "글자로 바꾸는 중…" }[st];
+  });
+  $("direct-oneshot").prepend(oneshot);
+}
+
+async function onSpoken(said) {
+  // "증상 … 조치 …"처럼 말하면 칸을 나눠 넣고, 아니면 증상으로 씁니다.
+  const { fields } = await postJson("/api/split", { text: said });
+  const symptom = fields.symptom || (fields.action || fields.location ? fields.unsplit : said) || said;
+  $("symptom").value = symptom; syncSymptom();
+  if (fields.action) { $("action").value = fields.action; }
+  if (fields.location) $("location").value = fields.location;
+  if (fields.vehicle) $("vehicle").value = fields.vehicle;
+  await findSimilar();
+  if (fields.action) openRecord();
+}
+
+/* 유사 사례 */
+async function findSimilar() {
+  const query = $("symptom").value.trim();
+  if (!query) return;
+  const data = await postJson("/api/search", { query });
+  if (data.error) { notice("search", data.error); return; }
+  notice("search", "");
+  cases = data.results; highlight = data.highlight;
+  $("similar-title").textContent = "유사 과거 사례";
+  const ds = data.delay_summary;
+  $("stats").hidden = !cases.length;
+  $("stats").replaceChildren(
+    el("span", {}, "장치 분류 ", el("b", {}, data.device)),
+    ds ? el("span", {}, "평균 지연 ", el("b", {}, `${ds.average}분`)) : null,
+    ds ? el("span", {}, "최대 지연 ", el("b", {}, `${ds.max}분`)) : null,
+    ds ? el("span", {}, "지연 발생 ", el("b", {}, `${ds.delayed}/${ds.count}건`)) : null);
+  $("similar-sub").textContent = (data.mode === "hybrid" ? "키워드 + AI" : "키워드") + ` · 상위 ${cases.length}건 · 최근 순`;
+  $("cards").replaceChildren(...(cases.length ? cases.map((c) => card(c))
+    : [el("li", { class: "empty" }, "비슷한 과거 사례가 없습니다. 다른 표현으로 적어 보세요.")]));
+
+}
+
+function value(c, key) {
+  const v = c[key];
+  return el("dd", v === "미기록" ? { class: "missing" } : {}, v, c.filled.includes(key) ? el("span", { class: "fake" }, "가상") : null);
+}
+
+function card(c) {
+  const item = el("li", { class: "card" });
+  const head = el("button", { type: "button" },
+    el("span", { class: "num" }, String(cases.indexOf(c) + 1)),
+    el("div", { class: "card-meta" }, c.occurred, el("br"), c.location + (c.filled.includes("location") ? " (가상)" : "")),
+    el("div", { class: "card-text" }, highlighted(c.description)),
+    el("div", { class: "chips" }, el("span", { class: "chip", title: "원문 단어로 자동 분류" }, c.device),
+       c.delay_minutes ? el("span", { class: "chip delay" }, `지연 ${c.delay_minutes}분`) : null,
+       el("span", { class: "chip sim" }, `유사 ${c.similarity_rank}위`)));
+  head.onclick = () => {
+    const open = item.classList.toggle("open");
+    if (!open) { item.lastChild !== head && item.lastChild.remove(); return; }
+    reference = c.id; showRef();
+    const a = c.action;
+    item.append(el("div", { class: "card-more" },
+      el("dl", {}, el("dt", {}, "관리번호"), el("dd", {}, c.id), el("dt", {}, "차량 수"), value(c, "vehicle_count"),
+         el("dt", {}, "지연"), el("dd", {}, c.delay_minutes == null ? "미기록" : `${c.delay_minutes}분`),
+         el("dt", {}, "지장열차"), el("dd", {}, c.affected_trains == null ? "미기록" : `${c.affected_trains}대`),
+         el("dt", {}, "시발역"), value(c, "origin"), el("dt", {}, "종착역"), value(c, "destination")),
+      a ? el("div", { class: "action-box" }, el("b", {}, "당시 조치 "), a.text,
+             el("div", { class: "demo" }, a.is_demo ? `${a.team} · ${a.type} — 시연용 데모 데이터, 실제 정비 기록 아님` : "원문에서 발췌")) : null));
+  };
+  item.append(head);
+  return item;
+}
+
+/* 기록 */
+function setMode(mode) {
+  recordMode = mode;
+  $("mode-search").setAttribute("aria-pressed", String(mode === "search"));
+  $("mode-direct").setAttribute("aria-pressed", String(mode === "direct"));
+  $("rec-symptom").hidden = mode === "direct";
+  $("direct-oneshot").hidden = mode === "search" || !server.voice;
+  $("direct-row").hidden = mode === "search";
+  $("msg").textContent = "";
+  showRef();
+  if (mode === "direct") $("direct-symptom").focus();
+}
+function showRef() {
+  if (!reference || recordMode === "direct") { $("ref").hidden = true; return; }
+  $("ref").hidden = false;
+  $("ref").replaceChildren("참고 사례: " + reference,
+    el("button", { type: "button", onclick: () => { reference = ""; showRef(); }, "aria-label": "참고 사례 지우기" }, "✕"));
+}
+function openRecord() {
+  $("record").hidden = false; $("record-open").hidden = true; showRef();
+  $("record").scrollIntoView({ behavior: "smooth", block: "start" });
+  if (!$("action").value) $("action").focus();
+}
+async function save() {
+  const direct = recordMode === "direct";
+  const data = await postJson("/api/records", { symptom: direct ? $("direct-symptom").value : $("symptom").value,
+    action: $("action").value, location: $("location").value, vehicle: $("vehicle").value,
+    reference: direct ? "" : reference });
+  const msg = $("msg");
+  if (data.error) { msg.className = "msg error"; msg.textContent = data.error; return; }
+  msg.className = "msg ok"; msg.textContent = `저장했습니다 · 기록번호 ${data.record["기록번호"]}`;
+  for (const id of ["action", "location", "vehicle", "direct-symptom"]) $(id).value = "";
+  loadRecent();
+}
+function syncSymptom() {
+  const v = $("symptom").value.trim();
+  $("rec-symptom").textContent = v || "왼쪽에 입력한 증상이 들어갑니다";
+  $("rec-symptom").className = "readonly" + (v ? "" : " placeholder");
+}
+async function loadRecent() {
+  if (!server.records) { $("recent").hidden = true; $("record").hidden = true; return; }
+  const data = await (await fetch("/api/records")).json();
+  $("recent-list").replaceChildren(...(data.records.length ? data.records.map((r) => el("li", {},
+    el("div", { class: "card-meta" }, `${r["기록번호"]} · ${r["발생일시"]}${r["발생장소"] ? " · " + r["발생장소"] : ""}`),
+    el("div", {}, el("b", {}, r["고장증상"]), " → ", r["조치내용"]))) : [el("li", { class: "empty" }, "아직 저장한 기록이 없습니다.")]));
+}
+
+$("symptom-form").onsubmit = (e) => { e.preventDefault(); findSimilar(); };
+$("symptom").addEventListener("input", syncSymptom);
+$("mode-search").onclick = () => setMode("search");
+$("mode-direct").onclick = () => setMode("direct");
+$("now").textContent = new Date().toLocaleString("ko-KR", { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" });
+$("record-open").onclick = openRecord;
+$("save").onclick = save;
+refreshStatus().then(loadRecent);
+</script>
+</body>
+</html>
